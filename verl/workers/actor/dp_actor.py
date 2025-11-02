@@ -371,6 +371,8 @@ class DataParallelPPOActor(BasePPOActor):
             "old_log_probs",
             "advantages",
         ]
+        #cursor: 不再使用acc，改用token_level_scores推断正负
+        #cursor
         if self.config.use_kl_loss:
             select_keys.append("ref_log_prob")
         # Include pre-computed IS weights if present in batch
@@ -380,6 +382,10 @@ class DataParallelPPOActor(BasePPOActor):
 
         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+        #cursor: keep group uid for within-group DPO pairing
+        if "uid" in data.non_tensor_batch:
+            non_tensor_select_keys.append("uid")
+        #cursor
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
 
@@ -436,40 +442,135 @@ class DataParallelPPOActor(BasePPOActor):
                         else:
                             old_log_prob = model_inputs["old_log_probs"]
 
-                    loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
-                    # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+                    #cursor: switch GRPO policy loss to DPO pairwise loss over pos/neg within each group
+                    #cursor 说明: 当adv_estimator=grpo时启用DPO配对loss，以下注释标明每个张量的形状与作用
+                    use_dpo_for_grpo = str(data.meta_info.get("adv_estimator", "")).lower() == "grpo"
+                    if use_dpo_for_grpo:
+                        import torch.nn.functional as F
 
-                    # Extract pre-computed rollout importance sampling weights if present
-                    # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
-                    rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+                    #cursor 基于token_level_scores推断正负；uids用于按组配对
+                        #cursor seq_scores: [B]，由token_level_scores * response_mask按序列求和
+                        if "token_level_scores" in model_inputs:
+                            seq_scores = (model_inputs["token_level_scores"] * response_mask).sum(dim=-1)
+                        else:
+                            seq_scores = (model_inputs["token_level_rewards"] * response_mask).sum(dim=-1)
+                        uids = micro_batch.non_tensor_batch.get("uid", None)
+                        if uids is None:
+                            # fallback: single group
+                            uids = ["__single_group__"] * seq_scores.shape[0]
 
-                    # NOTE: Both mismatch diagnostic metrics (PPL, KL, etc.) and IS weight metrics
-                    # are computed centrally in ray_trainer.py for consistency and efficiency.
-                    # This ensures metrics are computed uniformly across all batches at the trainer level
-                    # and avoids redundant computation across workers and micro-batches.
+                        from collections import defaultdict
+                        #cursor 构建组到样本索引的映射: gid -> List[int]
+                        group_to_indices = defaultdict(list)
+                        for i, gid in enumerate(uids):
+                            group_to_indices[gid].append(i)
 
-                    # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
-                    # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
-                    policy_loss_fn = get_policy_loss_fn(loss_mode)
+                        #cursor: build per-sample valid mask (组内既有正(>0)又有负(<0))
+                        #cursor valid_sample_mask: [B] bool；True表示该样本所在组有效
+                        valid_sample_mask = torch.zeros(seq_scores.shape[0], dtype=torch.bool, device=seq_scores.device)
+                        for gid, idxs in group_to_indices.items():
+                            idx_tensor = torch.tensor(idxs, device=seq_scores.device)  # [B_g]
+                            s_g = seq_scores.index_select(0, idx_tensor)  # [B_g]
+                            has_pos = (s_g > 0).any()
+                            has_neg = (s_g < 0).any()
+                            if has_pos and has_neg:
+                                valid_sample_mask.index_fill_(0, idx_tensor, True)
+                        # 对无效组样本，断开其log_prob的计算图，清空梯度路径
+                        #cursor log_prob: [B, T_resp]；只对有效组保留梯度，对无效组使用detach版本
+                        log_prob = log_prob * valid_sample_mask.unsqueeze(-1) + log_prob.detach() * (~valid_sample_mask).unsqueeze(-1)
+                        #cursor
 
-                    # Compute policy loss (all functions return 4 values)
-                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
-                        old_log_prob=old_log_prob,
-                        log_prob=log_prob,
-                        advantages=advantages,
-                        response_mask=response_mask,
-                        loss_agg_mode=loss_agg_mode,
-                        config=self.config,
-                        rollout_is_weights=rollout_is_weights,
-                    )
+                        # sequence-level logps for policy and reference (here use old_log_probs as reference)
+                        #cursor seq_mask: [B, T_resp]; pi_seq_logps/ref_seq_logps: [B]
+                        seq_mask = response_mask
+                        pi_seq_logps = (log_prob * seq_mask).sum(dim=-1)
+                        ref_seq_logps = (old_log_prob * seq_mask).sum(dim=-1)
 
-                    if entropy_coeff != 0:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        # iterate within current micro-batch only
+                        # pair all positives with all negatives: num_pos * num_neg
+                        #cursor beta: 标量float，DPO温度；norm_factor: 标量float，组归一化因子
+                        beta = getattr(self.config, "dpo_beta", 0.1)
+                        norm_factor = getattr(self.config, "dpo_norm_factor", 1.0)
 
-                        # compute policy loss
-                        policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        # 按组累加：每组(所有pair的loss之和)/(group_size*norm_factor)
+                        #cursor total_group_normed_loss: 标量tensor；valid_group_count: python整型计数
+                        total_group_normed_loss = torch.tensor(0.0, device=pi_seq_logps.device)
+                        valid_group_count = 0
+                        for gid, idxs in group_to_indices.items():
+                            idx_tensor = torch.tensor(idxs, device=pi_seq_logps.device)  # [B_g]
+                            s_g = seq_scores.index_select(0, idx_tensor)  # [B_g]
+                            pos_mask = s_g > 0  # [B_g] bool
+                            neg_mask = s_g < 0  # [B_g] bool
+                            if pos_mask.any() and neg_mask.any():
+                                pos_idx = idx_tensor[pos_mask]  # [P]
+                                neg_idx = idx_tensor[neg_mask]  # [N]
+
+                                #cursor pi_pos/ref_pos: [P,1]; pi_neg/ref_neg: [1,N]
+                                pi_pos = pi_seq_logps.index_select(0, pos_idx)[:, None]
+                                pi_neg = pi_seq_logps.index_select(0, neg_idx)[None, :]
+                                ref_pos = ref_seq_logps.index_select(0, pos_idx)[:, None]
+                                ref_neg = ref_seq_logps.index_select(0, neg_idx)[None, :]
+
+                                #cursor logits: [P,N]；losses: [P,N]（softplus(-beta*logits) = -log(sigmoid(beta*logits))）
+                                logits = (pi_pos - pi_neg) - (ref_pos - ref_neg)
+                                # -log(sigmoid(beta * logits))
+                                losses = F.softplus(-beta * logits)
+
+                                #cursor group_size: python整型；group_loss_sum/group_normed: 标量tensor
+                                group_size = idx_tensor.numel()
+                                group_loss_sum = losses.sum()
+                                group_normed = group_loss_sum / (group_size * norm_factor)
+                                total_group_normed_loss = total_group_normed_loss + group_normed
+                                valid_group_count += 1
+                            else:
+                                #cursor 无效组：不计入loss（已清空其激活）
+                                pass
+
+                        if valid_group_count > 0:
+                            dpo_loss = total_group_normed_loss  #cursor dpo_loss: 标量tensor
+                        else:
+                            # no valid groups in this micro-batch
+                            dpo_loss = torch.tensor(0.0, device=pi_seq_logps.device)  #cursor 无有效组，loss为0
+
+                        # base policy loss from DPO
+                        policy_loss = dpo_loss  #cursor 用DPO损失作为策略主损失
+
+                        # metrics placeholders matching existing logging pattern
+                        pg_loss = dpo_loss  #cursor 标量tensor，占位
+                        pg_clipfrac = torch.tensor(0.0, device=pi_seq_logps.device)  #cursor 占位
+                        ppo_kl = torch.tensor(0.0, device=pi_seq_logps.device)  #cursor 占位
+                        pg_clipfrac_lower = torch.tensor(0.0, device=pi_seq_logps.device)  #cursor 占位
                     else:
-                        policy_loss = pg_loss
+                        loss_mode = self.config.policy_loss.get("loss_mode", "vanilla")
+                        # vanilla -> verl.trainer.ppo.core_algos.compute_policy_loss_vanilla
+
+                        # Extract pre-computed rollout importance sampling weights if present
+                        # Weights are computed centrally in trainer and added when algorithm.rollout_is=True
+                        rollout_is_weights = model_inputs.get("rollout_is_weights", None)
+
+                        # gpg -> verl.trainer.ppo.core_algos.compute_policy_loss_gpg
+                        # clip_cov -> verl.trainer.ppo.core_algos.compute_policy_loss_clip_cov
+                        policy_loss_fn = get_policy_loss_fn(loss_mode)
+
+                        # Compute policy loss (all functions return 4 values)
+                        pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = policy_loss_fn(
+                            old_log_prob=old_log_prob,
+                            log_prob=log_prob,
+                            advantages=advantages,
+                            response_mask=response_mask,
+                            loss_agg_mode=loss_agg_mode,
+                            config=self.config,
+                            rollout_is_weights=rollout_is_weights,
+                        )
+
+                        if entropy_coeff != 0:
+                            entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+
+                            # compute policy loss
+                            policy_loss = pg_loss - entropy_loss * entropy_coeff
+                        else:
+                            policy_loss = pg_loss
+                    #cursor
 
                     if self.config.use_kl_loss:
                         ref_log_prob = model_inputs["ref_log_prob"]
@@ -490,14 +591,21 @@ class DataParallelPPOActor(BasePPOActor):
                         loss = policy_loss * loss_scale_factor
                     loss.backward()
 
-                    micro_batch_metrics.update(
-                        {
-                            "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
-                            "actor/pg_clipfrac": pg_clipfrac.detach().item(),
-                            "actor/ppo_kl": ppo_kl.detach().item(),
-                            "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
-                        }
-                    )
+                    #cursor: log DPO loss if used; otherwise keep PPO metrics
+                    if use_dpo_for_grpo:
+                        micro_batch_metrics.update({
+                            "actor/dpo_loss": pg_loss.detach().item() * loss_scale_factor
+                        })
+                    else:
+                        micro_batch_metrics.update(
+                            {
+                                "actor/pg_loss": pg_loss.detach().item() * loss_scale_factor,
+                                "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+                                "actor/ppo_kl": ppo_kl.detach().item(),
+                                "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
+                            }
+                        )
+                    #cursor
                     append_to_dict(metrics, micro_batch_metrics)
 
                 grad_norm = self._optimizer_step()
